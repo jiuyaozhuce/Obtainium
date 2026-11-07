@@ -159,6 +159,7 @@ void main() async {
         systemNavigationBarColor: Colors.transparent,
         statusBarColor: Colors.transparent,
         systemStatusBarContrastEnforced: false,
+        systemNavigationBarContrastEnforced: false,
       ),
     );
     unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));

@@ -1,0 +1,142 @@
+name: Fork Sync & Release
+
+# 定时同步上游 ImranR98/Obtainium 的「最新正式 release tag」（排除 prerelease，绝不使用未发布的 main 快照），
+# 重打导航栏着色修复（透明 + 关闭强制遮罩，深浅模式都跟随应用底色），
+# 用本 fork 自有签名构建 Android APK 并发布到与上游同名的 Release tag（如 v1.7.4），版本号完全跟随上游。
+on:
+  schedule:
+    - cron: '17 19 * * *'   # 每天 03:17 (北京时间) 检查上游
+  workflow_dispatch:        # 手动触发：总是重新构建并发布
+
+permissions:
+  contents: write
+
+jobs:
+  sync-build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Sync upstream release tag & decide build
+        id: sync
+        env:
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BEFORE=$(git rev-parse HEAD)
+          git remote add upstream https://github.com/ImranR98/Obtainium.git \
+            || git remote set-url upstream https://github.com/ImranR98/Obtainium.git
+          git fetch upstream --tags --force
+
+          # 仅取上游「最新正式发布」tag（排除 prerelease），绝不使用未发布的 main 快照
+          TAG=$(gh release list --repo ImranR98/Obtainium --limit 100 \
+                  --json tagName,isPrerelease,publishedAt \
+                  --jq '[.[] | select(.isPrerelease==false)] | sort_by(.publishedAt) | reverse | .[0].tagName')
+          if [ -z "$TAG" ]; then
+            echo "no upstream release found"; exit 1
+          fi
+          echo "target upstream tag: $TAG"
+
+          # 本 fork 已发布的最新版本（用于判断是否有上游更新，避免无变化时每天重复发版）
+          CURRENT=$(gh release list --repo ${{ github.repository }} --limit 1 \
+                     --json tagName --jq '.[0].tagName // ""' || true)
+          echo "current fork release: $CURRENT"
+
+          BUILD=false
+          if [ "$EVENT" = "workflow_dispatch" ]; then BUILD=true; fi
+          if [ "$TAG" != "$CURRENT" ]; then BUILD=true; fi
+          echo "build=$BUILD"
+
+          if [ "$BUILD" != "true" ]; then
+            echo "no upstream update, skip"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 把 main 重置为该正式 tag（丢弃分叉提交，避免合并冲突）
+          git reset --hard "$TAG"
+
+          # 恢复本 fork 自己的 CI 工作流目录（只保留 fork.yml；删掉上游的 release/fastlane/translation 工作流，避免它们被触发）。
+          # 先整体删除再 checkout，确保彻底还原成 BEFORE 版（= fork main 现状），使 push 时 workflow 文件零 diff，绕开 workflows 权限检查。
+          rm -rf .github/workflows
+          git checkout "$BEFORE" -- .github/workflows/
+
+          # 导航栏着色修复：上游 lib/main.dart 只设了 systemStatusBarContrastEnforced:false，
+          # 但漏设 systemNavigationBarContrastEnforced（默认 true → 系统强制叠加遮罩，鸿蒙/部分设备下不随主题变深/变浅）。
+          # 补上 false：导航栏透明、透出 App 自身灰/深色背景，深浅模式都与主题一致。
+          sed -i 's|^\([[:space:]]*\)systemStatusBarContrastEnforced: false,|\1systemStatusBarContrastEnforced: false,\n\1systemNavigationBarContrastEnforced: false,|' lib/main.dart
+
+          # 改包名：只改 applicationId（安装身份），使本 fork 可与官方版并存安装。
+          # namespace 保持 dev.imranr.obtainium 不变，Kotlin 源码包名/目录无需重构；
+          # AndroidManifest 里 provider 的 android:authorities 用 ${applicationId} 占位符，会自动跟随。
+          sed -i 's|^\([[:space:]]*\)applicationId = "dev.imranr.obtainium"|\1applicationId = "dev.imranr.obtainium.fork"|' android/app/build.gradle.kts
+
+          git add -A
+          git commit -m "chore: sync upstream $TAG + nav bar contrast fix"
+          git push --force origin main
+
+          echo "build=true" >> "$GITHUB_OUTPUT"
+          echo "target_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Android Signing
+        if: steps.sync.outputs.build == 'true'
+        run: |
+          echo "${{ secrets.KEYSTORE }}" | base64 --decode > android/app/keystore.jks
+          {
+            echo "storePassword=${{ secrets.STORE_PASSWORD }}"
+            echo "keyPassword=${{ secrets.KEY_PASSWORD }}"
+            echo "keyAlias=${{ secrets.KEY_ALIAS }}"
+            echo "storeFile=keystore.jks"
+          } > android/key.properties
+
+      - name: Setup Java
+        if: steps.sync.outputs.build == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Flutter
+        if: steps.sync.outputs.build == 'true'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Get Flutter Dependency
+        if: steps.sync.outputs.build == 'true'
+        run: |
+          flutter --version
+          flutter pub get
+
+      - name: Build APK (arm64-v8a only, flavor normal, signed)
+        if: steps.sync.outputs.build == 'true'
+        run: |
+          # 可复现构建（上游同款处理）
+          sed -i -e 's/-Wl,/-Wl,--build-id=none,/' ${PUB_CACHE:-$HOME/.pub-cache}/hosted/*/jni-*/src/CMakeLists.txt 2>/dev/null || true
+          # 只构建 arm64-v8a（--target-platform android-arm64），覆盖几乎所有现代安卓设备，产物更小
+          flutter build apk --release --flavor normal --target-platform android-arm64
+
+      - name: Publish release tagged with upstream version
+        if: steps.sync.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG=${{ steps.sync.outputs.target_tag }}   # 上游正式 tag，如 v1.7.4 —— 版本号完全跟随上游
+          SRC=$TAG
+          # 同版本重复构建（手动重跑）时删除旧 release 再重建；跨版本则自然累积版本历史
+          gh release delete "$TAG" --cleanup-tag -y 2>/dev/null || true
+          APK=$(find build/app/outputs/flutter-apk -name '*.apk' | head -1)
+          NOTES="Automated build synced from upstream ImranR98/Obtainium @ ${SRC} (formal release tag, NOT a main snapshot). Package: dev.imranr.obtainium.fork (renamed applicationId so it installs ALONGSIDE the official Obtainium; same app, different install id; signed with this fork's own keystore). Architecture: arm64-v8a ONLY (covers all modern Android devices). Includes nav-bar contrast fix: systemNavigationBarContrastEnforced set to false so the system navigation bar is transparent and follows the app's light/dark background (fixes inconsistent nav bar color on HarmonyOS / some devices). Version follows upstream tag exactly. Built at $(date -u)."
+          gh release create "$TAG" "$APK" \
+            --title "Obtainium Fork ${SRC} ($(date -u +%Y-%m-%d))" \
+            --notes "$NOTES"
